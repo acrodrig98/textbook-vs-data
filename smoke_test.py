@@ -7,15 +7,22 @@ Checks three things on Gemma-2-2B:
 
 Run it on a CUDA GPU after setup.sh:  python smoke_test.py
 """
+import time
+
 import torch
 from circuit_tracer import ReplacementModel
 
 assert torch.cuda.is_available(), "No CUDA GPU visible - run this on a GPU machine."
 print("GPU:", torch.cuda.get_device_name(0))
 
+print("\nLoading Gemma-2-2B + transcoders. After the downloads finish, it can stay quiet for")
+print("several minutes while it builds the model and moves it to the GPU. Don't stop it.", flush=True)
+t0 = time.time()
 # bfloat16 as in the official demos; the float32 default does not fit on a 15GB GPU
 model = ReplacementModel.from_pretrained("google/gemma-2-2b", "gemma", dtype=torch.bfloat16)
 tok = model.tokenizer
+print(f"Model loaded in {time.time() - t0:.0f}s. "
+      f"GPU memory in use: {torch.cuda.memory_allocated() / 1e9:.1f} GB", flush=True)
 
 
 def next_token_logits(prompt: str) -> torch.Tensor:

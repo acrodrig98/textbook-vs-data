@@ -1,0 +1,288 @@
+"""Week 1 prompt generator for Textbook vs. Data.
+
+Every item is a small table of (x, y) measurements generated from y = k * x^p. In a
+"conflict" item, the data exponent p differs from the textbook exponent for that law. In a
+"congruent" item, the data follows the textbook law. Congruent items are the control: they
+measure letter bias and basic competence.
+
+Each underlying data table is rendered at three prior-strength levels that differ only
+in wording:
+  named_law   - the law is named, with real variable names ("An Ohm's law experiment ...")
+  names_only  - real variable names and units, no law named
+  anonymous   - x and y only
+So any difference in behavior between levels is caused by the wording, not the data.
+
+Two answer formats:
+  mc       - "Which formula fits the data? A) ...  B) ...\\nAnswer:"; the target is " A" or " B"
+             (both single tokens in Gemma-2). Every item appears in both letter orders.
+  numeric  - the table continues with a query row ending in "y=" (no space). The data answer
+             and the alternative answer always start with different digits, so the first
+             predicted token decides it (Gemma-2 tokenizes digits individually).
+
+Usage (from the repo root):
+  python -m prompts.generate --out data/week1.jsonl
+  python -m prompts.generate --out data/week1.jsonl --preview 3
+"""
+from __future__ import annotations
+
+import argparse
+import itertools
+import json
+import random
+from collections import Counter
+from dataclasses import dataclass, field
+from fractions import Fraction
+from math import isqrt
+from pathlib import Path
+
+GENERATOR_VERSION = "week1-v1"
+PRIOR_LEVELS = ("named_law", "names_only", "anonymous")
+FORMATS = ("mc", "numeric")
+
+
+@dataclass(frozen=True)
+class Law:
+    key: str
+    x_sym: str
+    y_sym: str
+    named_header: str          # names the law
+    names_header: str          # real variables, no law name
+    textbook_p: Fraction
+    counterfactual_ps: tuple[Fraction, ...]
+    coefficients: tuple[int, ...]
+    x_grid: tuple[int, ...]    # chosen so every y is an integer and x=1 (uninformative) is excluded
+    alt_for_congruent: tuple[Fraction, ...] = field(default=())  # distractors when data = textbook
+
+    def distractors(self) -> tuple[Fraction, ...]:
+        return self.alt_for_congruent or self.counterfactual_ps
+
+
+F = Fraction
+LAWS: dict[str, Law] = {
+    "ohm": Law(
+        key="ohm", x_sym="I", y_sym="V",
+        named_header="An Ohm's law experiment measured voltage V (volts) versus current I (amps) for a resistor:",
+        names_header="An experiment measured voltage V (volts) versus current I (amps):",
+        textbook_p=F(1), counterfactual_ps=(F(2), F(3)),
+        coefficients=(2, 3, 5), x_grid=(2, 3, 4, 5, 6, 7),
+    ),
+    "hooke": Law(
+        key="hooke", x_sym="x", y_sym="F",
+        named_header="A Hooke's law experiment measured the force F (newtons) needed to stretch a spring by x (cm):",
+        names_header="An experiment measured force F (newtons) versus extension x (cm):",
+        textbook_p=F(1), counterfactual_ps=(F(2), F(3)),
+        coefficients=(2, 3, 4), x_grid=(2, 3, 4, 5, 6, 7),
+    ),
+    "free_fall": Law(
+        key="free_fall", x_sym="t", y_sym="d",
+        named_header="A Galileo free-fall experiment measured the distance d (meters) a dropped ball falls in time t (seconds):",
+        names_header="An experiment measured distance d (meters) versus time t (seconds):",
+        textbook_p=F(2), counterfactual_ps=(F(1), F(3)),
+        coefficients=(5,), x_grid=(2, 3, 4, 5, 6, 7),
+    ),
+    "coulomb": Law(
+        key="coulomb", x_sym="r", y_sym="F",
+        named_header="A Coulomb's law experiment measured the force F (newtons) between two charges separated by r (cm):",
+        names_header="An experiment measured force F (newtons) versus separation r (cm):",
+        textbook_p=F(-2), counterfactual_ps=(F(-1), F(-3)),
+        coefficients=(32768,), x_grid=(2, 4, 8, 16, 32),
+    ),
+    "kepler": Law(
+        key="kepler", x_sym="a", y_sym="T",
+        named_header="Kepler's third law: astronomers measured the orbital period T (years) of planets with semi-major axis a (AU):",
+        names_header="Astronomers measured orbital period T (years) versus semi-major axis a (AU):",
+        textbook_p=F(3, 2), counterfactual_ps=(F(1), F(2)),
+        coefficients=(1,), x_grid=(4, 9, 16, 25, 36),
+    ),
+}
+
+
+def power(x: int, p: Fraction) -> Fraction:
+    """Exact x**p for integer or half-integer p (half-integers need x to be a perfect square)."""
+    if p.denominator == 1:
+        return Fraction(x) ** int(p)
+    if p.denominator == 2:
+        r = isqrt(x)
+        if r * r != x:
+            raise ValueError(f"{x}^{p} is not rational")
+        return Fraction(r) ** p.numerator
+    raise ValueError(f"unsupported exponent {p}")
+
+
+def law_value(k: int, x: int, p: Fraction) -> int:
+    y = k * power(x, p)
+    if y.denominator != 1:
+        raise ValueError(f"{k}*{x}^{p} = {y} is not an integer")
+    return int(y)
+
+
+def fmt_exponent(p: Fraction) -> str:
+    return str(p.numerator) if p.denominator == 1 else str(float(p))
+
+
+def fmt_formula(y_sym: str, x_sym: str, k: int, p: Fraction) -> str:
+    if p > 0:
+        coef = "" if k == 1 else str(k)
+        term = x_sym if p == 1 else f"{x_sym}^{fmt_exponent(p)}"
+        return f"{y_sym} = {coef}{term}"
+    q = -p
+    denom = x_sym if q == 1 else f"{x_sym}^{fmt_exponent(q)}"
+    return f"{y_sym} = {k}/{denom}"
+
+
+# Few-shot exemplars: anonymous, with coefficient 7, which no main item uses. Off by default.
+# MC exemplars have one A answer and one B answer, so they add no letter bias when both are used.
+_SHOT_MC = [
+    ("Here are measurements of y versus x:\nx=2, y=56\nx=3, y=189\n"
+     "Which formula fits the data? A) y = 7x^3  B) y = 7x\nAnswer: A\n\n"),
+    ("Here are measurements of y versus x:\nx=2, y=14\nx=4, y=28\n"
+     "Which formula fits the data? A) y = 7x^2  B) y = 7x\nAnswer: B\n\n"),
+]
+_SHOT_NUMERIC = [
+    "Here are measurements of y versus x:\nx=2, y=28\nx=3, y=63\nx=5, y=175\n\n",
+    "Here are measurements of y versus x:\nx=2, y=14\nx=4, y=28\nx=9, y=63\n\n",
+]
+
+
+def header_and_symbols(law: Law, level: str) -> tuple[str, str, str]:
+    if level == "named_law":
+        return law.named_header, law.x_sym, law.y_sym
+    if level == "names_only":
+        return law.names_header, law.x_sym, law.y_sym
+    if level == "anonymous":
+        return "Here are measurements of y versus x:", "x", "y"
+    raise ValueError(level)
+
+
+def table_lines(rows: list[tuple[int, int]], x_sym: str, y_sym: str) -> str:
+    return "".join(f"{x_sym}={x}, {y_sym}={y}\n" for x, y in rows)
+
+
+def pick_query_x(law: Law, used: set[int], k: int, p_data: Fraction, p_alt: Fraction, rng: random.Random):
+    """A held-out x where the data answer and the alternative answer start with different digits."""
+    candidates = []
+    for x in law.x_grid:
+        if x in used:
+            continue
+        y_d, y_a = law_value(k, x, p_data), law_value(k, x, p_alt)
+        if str(y_d)[0] != str(y_a)[0]:
+            candidates.append((x, y_d, y_a))
+    return rng.choice(candidates) if candidates else None
+
+
+def make_items(
+    laws: list[str],
+    n_rows_list: list[int],
+    formats: list[str],
+    samples_per_cell: int,
+    n_shots: int,
+    seed: int,
+) -> list[dict]:
+    rng = random.Random(seed)
+    items: list[dict] = []
+    max_coefs = max(len(LAWS[key].coefficients) for key in laws)
+    for law_key in laws:
+        law = LAWS[law_key]
+        # Balance laws: every law gets the same number of data tables per (exponent, rows) cell,
+        # whatever its number of coefficients. (coefficient, row subset) pairs are drawn without repeats.
+        n_tables = samples_per_cell * max_coefs
+        max_rows = len(law.x_grid) - (1 if "numeric" in formats else 0)
+        for p_data, n_rows in itertools.product([law.textbook_p, *law.counterfactual_ps], n_rows_list):
+            if n_rows > max_rows:
+                continue
+            combos = [(k, xs) for k in law.coefficients for xs in itertools.combinations(law.x_grid, n_rows)]
+            for sample, (k, xs) in enumerate(sorted(rng.sample(combos, min(n_tables, len(combos))))):
+                items += render_table(law, k, p_data, list(xs), sample, formats, n_shots, seed, rng)
+    return items
+
+
+def render_table(law: Law, k: int, p_data: Fraction, xs: list[int], sample: int,
+                 formats: list[str], n_shots: int, seed: int, rng: random.Random) -> list[dict]:
+    """All prompts for one data table: 3 prior levels x (2 MC letter orders + 1 numeric)."""
+    congruent = p_data == law.textbook_p
+    if congruent:
+        p_alt, alt_kind = rng.choice(law.distractors()), "distractor"
+    else:
+        p_alt, alt_kind = law.textbook_p, "textbook"
+
+    rows = [(x, law_value(k, x, p_data)) for x in xs]
+    query = pick_query_x(law, set(xs), k, p_data, p_alt, rng)
+    base_id = f"{law.key}-k{k}-p{fmt_exponent(p_data)}-n{len(xs)}-s{sample}"
+    common = dict(
+        generator_version=GENERATOR_VERSION, seed=seed, base_id=base_id, law=law.key,
+        k=k, p_textbook=float(law.textbook_p), p_data=float(p_data), p_alt=float(p_alt),
+        shift=float(abs(p_data - law.textbook_p)), congruent=congruent, alt_kind=alt_kind,
+        n_rows=len(xs), rows=rows, n_shots=n_shots,
+    )
+
+    out: list[dict] = []
+    for level in PRIOR_LEVELS:
+        header, x_sym, y_sym = header_and_symbols(law, level)
+        body = header + "\n" + table_lines(rows, x_sym, y_sym)
+        f_data = fmt_formula(y_sym, x_sym, k, p_data)
+        f_alt = fmt_formula(y_sym, x_sym, k, p_alt)
+
+        if "mc" in formats:
+            shots = "".join(_SHOT_MC[:n_shots])
+            for order in ("data_first", "alt_first"):
+                a, b = (f_data, f_alt) if order == "data_first" else (f_alt, f_data)
+                letter_data, letter_alt = ("A", "B") if order == "data_first" else ("B", "A")
+                out.append(dict(
+                    common, id=f"{base_id}-{level}-mc-{order}", prior_level=level,
+                    format="mc", order=order,
+                    prompt=shots + body + f"Which formula fits the data? A) {a}  B) {b}\nAnswer:",
+                    formula_data=f_data, formula_alt=f_alt,
+                    target_data=f" {letter_data}", target_alt=f" {letter_alt}",
+                ))
+
+        if "numeric" in formats and query is not None:
+            qx, y_d, y_a = query
+            out.append(dict(
+                common, id=f"{base_id}-{level}-numeric", prior_level=level,
+                format="numeric", order=None,
+                prompt="".join(_SHOT_NUMERIC[:n_shots]) + body + f"{x_sym}={qx}, {y_sym}=",
+                formula_data=f_data, formula_alt=f_alt,
+                query_x=qx, y_data=y_d, y_alt=y_a,
+                target_data=str(y_d)[0], target_alt=str(y_a)[0],
+            ))
+    return out
+
+
+def summarize(items: list[dict]) -> str:
+    c = Counter((it["format"], it["law"], "congruent" if it["congruent"] else "conflict") for it in items)
+    lines = [f"{len(items)} prompts ({len({it['base_id'] for it in items})} distinct data tables)"]
+    lines += [f"  {fmt:8} {law:10} {kind:10} {n}" for (fmt, law, kind), n in sorted(c.items())]
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--out", type=Path, default=Path("data/week1.jsonl"))
+    ap.add_argument("--laws", nargs="+", default=list(LAWS), choices=list(LAWS))
+    ap.add_argument("--rows", nargs="+", type=int, default=[1, 2, 3, 4], help="numbers of table rows to sweep")
+    ap.add_argument("--formats", nargs="+", default=list(FORMATS), choices=FORMATS)
+    ap.add_argument("--samples-per-cell", type=int, default=3, help="random row subsets per cell")
+    ap.add_argument("--shots", type=int, default=0, choices=[0, 1, 2], help="anonymous worked examples to prepend")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--preview", type=int, default=0, help="print this many example prompts")
+    args = ap.parse_args(argv)
+
+    items = make_items(args.laws, args.rows, args.formats, args.samples_per_cell, args.shots, args.seed)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    with args.out.open("w") as f:
+        for it in items:
+            f.write(json.dumps(it) + "\n")
+    print(summarize(items))
+    print(f"Wrote {args.out}")
+
+    if args.preview:
+        rng = random.Random(args.seed)
+        for it in rng.sample(items, min(args.preview, len(items))):
+            print("\n" + "=" * 70)
+            print(f"{it['id']}  (data: {it['formula_data']}, alt [{it['alt_kind']}]: {it['formula_alt']}, "
+                  f"target data/alt: {it['target_data']!r}/{it['target_alt']!r})")
+            print("-" * 70 + "\n" + it["prompt"])
+
+
+if __name__ == "__main__":
+    main()
