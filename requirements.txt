@@ -1,0 +1,12 @@
+# circuit-tracer from the official repo, pinned to the commit tested on 2026-11-22
+circuit-tracer @ git+https://github.com/safety-research/circuit-tracer.git@713ab192a5e12df63dd655b725191758ff1b96a3
+# These versions match what circuit-tracer 713ab19 resolved to on 2026-11-22
+transformers==4.57.3
+huggingface_hub==0.36.2
+# Analysis and notebooks
+pandas
+matplotlib
+seaborn
+jupyter
+ipywidgets
+pytest
