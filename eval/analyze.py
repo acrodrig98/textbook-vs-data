@@ -17,11 +17,13 @@ Usage:
   # merge runs of the same model (e.g. the made-up-law control scored separately):
   python -m eval.analyze results/week1_Qwen3-4B.jsonl results/week1_fakelaw_Qwen3-4B.jsonl --name week1_control_Qwen3-4B
 
-When the made-up-law level (fake_named) is present, the summary also splits the total textbook pull
-(anonymous - law named) into three steps measured on the same tables:
-  real law name -> made-up law name       : recall of the specific law
-  made-up name -> variable names only     : any named law, plus the experimental setting ("for a resistor")
-  variable names only -> anonymous x, y   : the physical variable names
+When extra levels (fake_named, setting_only) are present, the summary also splits the total textbook
+pull (anonymous - law named) into steps between consecutive levels, measured on the same tables:
+  real law name -> made-up law name      : recall of the specific law's name
+  made-up name -> setup only             : generic "X's law" framing
+  setup only -> variable names only      : the description of the setup ("for a resistor", "a dropped ball")
+  variable names only -> anonymous x, y  : the physical variable names
+With a level missing, the neighbouring steps merge (e.g. made-up name -> variable names = framing + setup).
 """
 from __future__ import annotations
 
@@ -32,11 +34,21 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-LEVELS = ["named_law", "fake_named", "names_only", "anonymous"]  # display order; only those present are shown
-LEVEL_LABELS = {"named_law": "Law named", "fake_named": "Made-up law named",
+LEVELS = ["named_law", "fake_named", "setting_only", "names_only", "anonymous"]  # display order; only those present are shown
+LEVEL_LABELS = {"named_law": "Law named", "fake_named": "Made-up law named", "setting_only": "Setup only, no name",
                 "names_only": "Variable names only", "anonymous": "Anonymous x, y"}
+STEP_LABELS = {
+    ("named_law", "fake_named"): "the specific law's name",
+    ("fake_named", "setting_only"): "generic 'X's law' framing",
+    ("setting_only", "names_only"): "description of the setup",
+    ("fake_named", "names_only"): "any named law + setup description",
+    ("named_law", "setting_only"): "the law's name",
+    ("named_law", "names_only"): "law name + setup description",
+    ("names_only", "anonymous"): "physical variable names",
+}
 LEVEL_LABELS_WRAPPED = {"named_law": "Law\nnamed", "fake_named": "Made-up\nlaw named",
-                        "names_only": "Variable\nnames only", "anonymous": "Anonymous\nx, y"}
+                        "setting_only": "Setup only,\nno name", "names_only": "Variable\nnames only",
+                        "anonymous": "Anonymous\nx, y"}
 FORMAT_LABELS = {"mc": "Multiple choice", "numeric": "Numeric prediction"}
 
 # Reference palette (dataviz skill): sequential blue ramp, chart chrome, categorical slots 1-2
@@ -296,18 +308,21 @@ def summarize(df: pd.DataFrame, dec: pd.DataFrame, rate_df: pd.DataFrame, model:
                                                      else "NO-GO: no clear prior pull")
         lines.append(f"  {fmt:8} anonymous accuracy {acc_cong:.0%} (congruent) / {acc_conf:.0%} (conflict); "
                      f"prior pull {pull:+.0%} [95% CI {lo:+.0%}, {hi:+.0%}] over {n} tables -> {verdict}")
-    if "fake_named" in levels:
+    if len(levels) > 3:
         lines.append("")
-        lines.append("Where the textbook pull comes from (conflict tables; change in siding-with-data rate, 95% CI):")
-        steps = [("named_law", "fake_named", "real law name -> made-up name   (recall of the specific law)"),
-                 ("fake_named", "names_only", "made-up name -> variable names (any named law + setting)"),
-                 ("names_only", "anonymous", "variable names -> anonymous     (physical variable names)"),
-                 ("named_law", "anonymous", "total: real law name -> anonymous")]
+        lines.append("Where the textbook pull comes from (conflict tables; change in siding-with-data rate "
+                     "between neighbouring levels, 95% CI):")
         for fmt in ("mc", "numeric"):
-            for less, more, label in steps:
+            fmt_levels = present_levels(dec[dec["format"] == fmt])
+            if "named_law" not in fmt_levels or "anonymous" not in fmt_levels:
+                continue
+            for less, more in zip(fmt_levels, fmt_levels[1:]):
                 pull, lo, hi, n = prior_pull(dec, fmt, more_data=more, less_data=less)
-                if n:
-                    lines.append(f"  {fmt:8} {label}: {pull:+.0%} [{lo:+.0%}, {hi:+.0%}]  ({n} tables)")
+                label = f"{LEVEL_LABELS[less]} -> {LEVEL_LABELS[more]}"
+                why = STEP_LABELS.get((less, more), "")
+                lines.append(f"  {fmt:8} {label:46} {pull:+.0%} [{lo:+.0%}, {hi:+.0%}]  {why}")
+            pull, lo, hi, n = prior_pull(dec, fmt)
+            lines.append(f"  {fmt:8} {'total: Law named -> Anonymous x, y':46} {pull:+.0%} [{lo:+.0%}, {hi:+.0%}]  ({n} tables)")
     return "\n".join(lines)
 
 

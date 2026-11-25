@@ -139,3 +139,20 @@ def test_fake_names_are_not_real_law_names():
     for law in LAWS.values():
         assert law.fake_name != law.real_name
         assert not any(name in law.fake_name for name in real_surnames), law.fake_name
+
+
+def test_setting_only_keeps_the_setup_and_drops_the_name():
+    for law in LAWS.values():
+        named_setup = law.named_header.split("measured", 1)[1]
+        assert law.setting_header.split("measured", 1)[1] == named_setup, law.key
+        assert law.real_name not in law.setting_header and law.fake_name not in law.setting_header
+        assert "law" not in law.setting_header.lower()
+
+
+def test_setting_only_prompts_match_named_tables():
+    named = make_items(list(LAWS), [2, 3], ["mc"], 1, 0, seed=0, levels=("named_law",))
+    setting = make_items(list(LAWS), [2, 3], ["mc"], 1, 0, seed=0, levels=("setting_only",))
+    for a, b in zip(named, setting):
+        assert (a["base_id"], a["order"], a["rows"], a["target_data"]) == (b["base_id"], b["order"], b["rows"], b["target_data"])
+        law = LAWS[a["law"]]
+        assert b["prompt"] == a["prompt"].replace(law.named_header, law.setting_header)

@@ -29,7 +29,7 @@ python -m prompts.generate --out data/week1_fakelaw.jsonl --levels fake_named --
 python -m eval.behavior --model Qwen/Qwen3-4B --prompts data/week1_fakelaw.jsonl
 python -m eval.analyze results/week1_Qwen3-4B.jsonl results/week1_fakelaw_Qwen3-4B.jsonl --name week1_control_Qwen3-4B
 ```
-The summary then splits the textbook pull into three steps: real name to made-up name (recall of the specific law), made-up name to variable names only (any named law plus the experimental setting), and variable names to anonymous.
+`--levels setting_only` does the same with the law's name removed and the setup description kept word for word. With all five levels merged, the summary splits the textbook pull into steps between neighbouring levels: the law's name (real to made-up), generic "X's law" framing (made-up to setup only), the setup description (setup only to variable names), and the variable names (to anonymous).
 
 ## Layout
 ```
