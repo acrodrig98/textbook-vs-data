@@ -6,3 +6,6 @@ graphs/
 *.pt
 *.safetensors
 .env
+data/
+.DS_Store
+*.zip
