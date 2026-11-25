@@ -73,3 +73,29 @@ def test_batched_scoring_matches_single_prompts():
     batched = next_token_logits(model, tok, prompts, "cpu")
     single = torch.cat([next_token_logits(model, tok, [p], "cpu") for p in prompts])
     assert torch.allclose(batched, single, atol=1e-4)
+
+
+def test_breakdown_with_made_up_law_level():
+    """If only the real law name pulls, the whole pull shows up in the real -> made-up step."""
+    from prompts.generate import ALL_LEVELS
+    items = make_items(list(LAWS), [1, 2], ["mc"], samples_per_cell=2, n_shots=0, seed=0, levels=ALL_LEVELS)
+    rows = []
+    for it in items:
+        follows = it["congruent"] or it["prior_level"] != "named_law"
+        diff = 2.0 if follows else -2.0
+        rows.append({**it, "logit_data": diff / 2, "logit_alt": -diff / 2, "logit_diff": diff,
+                     "p_two_targets": 0.9, "top1_token": it["target_data"]})
+    dec = table_decisions(pd.DataFrame(rows))
+    real_step = prior_pull(dec, "mc", more_data="fake_named", less_data="named_law")
+    framing_step = prior_pull(dec, "mc", more_data="names_only", less_data="fake_named")
+    assert real_step[0] == pytest.approx(1.0) and framing_step[0] == pytest.approx(0.0)
+
+
+def test_load_many_rejects_overlapping_files(tmp_path):
+    import json
+    from eval.analyze import load_many
+    rec = {"id": "x-1", "meta": {"model": "m"}}
+    for name in ("a.jsonl", "b.jsonl"):
+        (tmp_path / name).write_text(json.dumps(rec) + "\n")
+    with pytest.raises(ValueError, match="more than one file"):
+        load_many([tmp_path / "a.jsonl", tmp_path / "b.jsonl"])

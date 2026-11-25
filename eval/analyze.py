@@ -14,6 +14,14 @@ Outputs:
 
 Usage:
   python -m eval.analyze results/week1_gemma-2-2b.jsonl
+  # merge runs of the same model (e.g. the made-up-law control scored separately):
+  python -m eval.analyze results/week1_Qwen3-4B.jsonl results/week1_fakelaw_Qwen3-4B.jsonl --name week1_control_Qwen3-4B
+
+When the made-up-law level (fake_named) is present, the summary also splits the total textbook pull
+(anonymous - law named) into three steps measured on the same tables:
+  real law name -> made-up law name       : recall of the specific law
+  made-up name -> variable names only     : any named law, plus the experimental setting ("for a resistor")
+  variable names only -> anonymous x, y   : the physical variable names
 """
 from __future__ import annotations
 
@@ -24,8 +32,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-LEVELS = ["named_law", "names_only", "anonymous"]
-LEVEL_LABELS = {"named_law": "Law named", "names_only": "Variable names only", "anonymous": "Anonymous x, y"}
+LEVELS = ["named_law", "fake_named", "names_only", "anonymous"]  # display order; only those present are shown
+LEVEL_LABELS = {"named_law": "Law named", "fake_named": "Made-up law named",
+                "names_only": "Variable names only", "anonymous": "Anonymous x, y"}
+LEVEL_LABELS_WRAPPED = {"named_law": "Law\nnamed", "fake_named": "Made-up\nlaw named",
+                        "names_only": "Variable\nnames only", "anonymous": "Anonymous\nx, y"}
 FORMAT_LABELS = {"mc": "Multiple choice", "numeric": "Numeric prediction"}
 
 # Reference palette (dataviz skill): sequential blue ramp, chart chrome, categorical slots 1-2
@@ -44,6 +55,26 @@ def load_results(path: Path) -> pd.DataFrame:
     with path.open() as f:
         df = pd.DataFrame([json.loads(line) for line in f])
     return df.drop(columns=["meta"], errors="ignore")
+
+
+def load_many(paths: list[Path]) -> tuple[pd.DataFrame, str]:
+    """Concatenate result files from one model. Fails if models differ or a prompt id repeats."""
+    models = set()
+    for path in paths:
+        with path.open() as f:
+            models.add(json.loads(f.readline()).get("meta", {}).get("model", path.stem))
+    if len(models) > 1:
+        raise ValueError(f"These files come from different models: {sorted(models)}")
+    df = pd.concat([load_results(p) for p in paths], ignore_index=True)
+    dupes = df["id"][df["id"].duplicated()]
+    if len(dupes):
+        raise ValueError(f"{len(dupes)} prompt ids appear in more than one file, e.g. {dupes.iloc[0]}")
+    return df, models.pop()
+
+
+def present_levels(frame: pd.DataFrame) -> list[str]:
+    have = set(frame["prior_level"])
+    return [lv for lv in LEVELS if lv in have]
 
 
 def letter_bias(df: pd.DataFrame) -> float:
@@ -76,18 +107,22 @@ def rates(dec: pd.DataFrame) -> pd.DataFrame:
     return out.rename(columns={"mean": "rate", "size": "n_tables"})
 
 
-def prior_pull(dec: pd.DataFrame, fmt: str, n_boot: int = 2000, seed: int = 0) -> tuple[float, float, float, int]:
-    """Anonymous minus law-named siding-with-data rate on conflict tables, with a paired bootstrap CI.
+def prior_pull(dec: pd.DataFrame, fmt: str, n_boot: int = 2000, seed: int = 0,
+               more_data: str = "anonymous", less_data: str = "named_law") -> tuple[float, float, float, int]:
+    """Siding-with-data rate at level `more_data` minus at `less_data`, on conflict tables,
+    with a paired bootstrap CI. Defaults give the total textbook pull (anonymous - law named).
 
     Each table appears at both levels with identical data, so the difference is computed per table
     and the tables are resampled together.
     """
     d = dec[(dec["format"] == fmt) & (~dec["congruent"])]
+    if not {more_data, less_data} <= set(d["prior_level"]):
+        return float("nan"), float("nan"), float("nan"), 0
     wide = d.pivot_table(index="base_id", columns="prior_level", values="sides_with_data", aggfunc="first")
-    wide = wide.dropna(subset=["anonymous", "named_law"])
+    wide = wide.dropna(subset=[more_data, less_data])
     if wide.empty:
         return float("nan"), float("nan"), float("nan"), 0
-    per_table = wide["anonymous"].astype(float).to_numpy() - wide["named_law"].astype(float).to_numpy()
+    per_table = wide[more_data].astype(float).to_numpy() - wide[less_data].astype(float).to_numpy()
     rng = np.random.default_rng(seed)
     boots = rng.choice(per_table, size=(n_boot, len(per_table)), replace=True).mean(axis=1)
     lo, hi = np.percentile(boots, [2.5, 97.5])
@@ -119,15 +154,26 @@ def plot_phase(cells: pd.DataFrame, path: Path, title: str) -> None:
     cmap = LinearSegmentedColormap.from_list("seq_blue", SEQ_BLUE)
     cmap.set_bad("#f0efec")
     formats = [f for f in ("mc", "numeric") if f in set(cells["format"])]
+    levels = present_levels(cells)
     shifts = sorted(cells["shift"].unique())
     rows = sorted(cells["n_rows"].unique())
 
-    fig, axes = plt.subplots(len(formats), 3, figsize=(11, 3.2 * len(formats) + 0.9),
+    fig, axes = plt.subplots(len(formats), len(levels), figsize=(3.7 * len(levels), 3.2 * len(formats) + 0.9),
                              squeeze=False, facecolor=SURFACE)
     for i, fmt in enumerate(formats):
-        for j, level in enumerate(LEVELS):
+        for j, level in enumerate(levels):
             ax = axes[i][j]
             sub = cells[(cells["format"] == fmt) & (cells["prior_level"] == level)]
+            if sub.empty:
+                ax.set_facecolor(SURFACE)
+                ax.set_xticks([]), ax.set_yticks([])
+                for spine in ax.spines.values():
+                    spine.set_visible(False)
+                ax.text(0.5, 0.5, "not run", ha="center", va="center", color=MUTED, fontsize=10,
+                        transform=ax.transAxes)
+                if i == 0:
+                    ax.set_title(LEVEL_LABELS[level], color=INK, fontsize=11, pad=8)
+                continue
             grid = np.full((len(shifts), len(rows)), np.nan)
             counts = np.zeros_like(grid)
             for _, r in sub.iterrows():
@@ -172,9 +218,10 @@ def plot_levels(rate_df: pd.DataFrame, path: Path, title: str) -> None:
     import matplotlib.pyplot as plt
 
     formats = [f for f in ("mc", "numeric") if f in set(rate_df["format"])]
-    fig, axes = plt.subplots(1, len(formats), figsize=(5.2 * len(formats), 3.6), squeeze=False,
+    fig, axes = plt.subplots(1, len(formats), figsize=(5.2 * len(formats), 3.8), squeeze=False,
                              facecolor=SURFACE, sharey=True)
-    x = np.arange(len(LEVELS))
+    levels = present_levels(rate_df)
+    x = np.arange(len(levels))
     series = [("congruent", "Congruent control: picks the data's formula", SERIES_2),
               ("conflict", "Conflict: sides with the data over the textbook law", SERIES_1)]
     for ax, fmt in zip(axes[0], formats):
@@ -184,7 +231,7 @@ def plot_levels(rate_df: pd.DataFrame, path: Path, title: str) -> None:
         ys_by_cond = {}
         for cond, label, color in series:
             sub = rate_df[(rate_df["format"] == fmt) & (rate_df["condition"] == cond)].set_index("prior_level")
-            ys_by_cond[cond] = [sub["rate"].get(level, np.nan) for level in LEVELS]
+            ys_by_cond[cond] = [sub["rate"].get(level, np.nan) for level in levels]
             ax.plot(x, ys_by_cond[cond], color=color, linewidth=2, marker="o", markersize=8,
                     markeredgecolor=SURFACE, markeredgewidth=2, label=label, zorder=3)
         # Label the higher point of each pair above it and the lower one below, so labels never collide
@@ -197,7 +244,8 @@ def plot_levels(rate_df: pd.DataFrame, path: Path, title: str) -> None:
                             xytext=(0, 9 if above else -16), ha="center", fontsize=9, color=INK_2)
         ax.margins(x=0.12)
         ax.axhline(0.5, color=AXIS, linewidth=1, linestyle=(0, (3, 3)), zorder=1)
-        ax.set_xticks(x, [LEVEL_LABELS[level] for level in LEVELS])
+        ax.set_xticks(x, [LEVEL_LABELS_WRAPPED[level] if len(levels) > 3 else LEVEL_LABELS[level]
+                          for level in levels])
         ax.set_ylim(0, 1.08)
         ax.yaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(1.0))
         ax.set_title(FORMAT_LABELS[fmt], color=INK, fontsize=11, loc="left")
@@ -223,13 +271,15 @@ def summarize(df: pd.DataFrame, dec: pd.DataFrame, rate_df: pd.DataFrame, model:
                          "probability is on the two answer tokens")
     lines.append("")
     lines.append("Siding-with-data rate by prior level (conflict = data vs textbook law; congruent = control):")
-    lines.append(f"{'format':9} {'condition':10} " + " ".join(f"{LEVEL_LABELS[lv]:>20}" for lv in LEVELS))
+    levels = present_levels(dec)
+    lines.append(f"{'format':9} {'condition':10} " + " ".join(f"{LEVEL_LABELS[lv]:>20}" for lv in levels))
     for fmt in ("mc", "numeric"):
         for cond in ("congruent", "conflict"):
             sub = rate_df[(rate_df["format"] == fmt) & (rate_df["condition"] == cond)].set_index("prior_level")
             if sub.empty:
                 continue
-            cells = " ".join(f"{sub['rate'].get(lv, np.nan):>19.0%} " for lv in LEVELS)
+            cells = " ".join(f"{'-' if np.isnan(v) else f'{v:.0%}':>19} "
+                             for v in (sub["rate"].get(lv, np.nan) for lv in levels))
             lines.append(f"{fmt:9} {cond:10} {cells}")
     lines.append("")
     lines.append("Go/no-go (suggested thresholds: anonymous accuracy >= "
@@ -246,29 +296,41 @@ def summarize(df: pd.DataFrame, dec: pd.DataFrame, rate_df: pd.DataFrame, model:
                                                      else "NO-GO: no clear prior pull")
         lines.append(f"  {fmt:8} anonymous accuracy {acc_cong:.0%} (congruent) / {acc_conf:.0%} (conflict); "
                      f"prior pull {pull:+.0%} [95% CI {lo:+.0%}, {hi:+.0%}] over {n} tables -> {verdict}")
+    if "fake_named" in levels:
+        lines.append("")
+        lines.append("Where the textbook pull comes from (conflict tables; change in siding-with-data rate, 95% CI):")
+        steps = [("named_law", "fake_named", "real law name -> made-up name   (recall of the specific law)"),
+                 ("fake_named", "names_only", "made-up name -> variable names (any named law + setting)"),
+                 ("names_only", "anonymous", "variable names -> anonymous     (physical variable names)"),
+                 ("named_law", "anonymous", "total: real law name -> anonymous")]
+        for fmt in ("mc", "numeric"):
+            for less, more, label in steps:
+                pull, lo, hi, n = prior_pull(dec, fmt, more_data=more, less_data=less)
+                if n:
+                    lines.append(f"  {fmt:8} {label}: {pull:+.0%} [{lo:+.0%}, {hi:+.0%}]  ({n} tables)")
     return "\n".join(lines)
 
 
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("results", type=Path)
+    ap.add_argument("results", type=Path, nargs="+", help="one or more result files from the same model")
+    ap.add_argument("--name", default=None, help="output name stem (default: the first file's name)")
     ap.add_argument("--figures-dir", type=Path, default=Path("figures"))
     args = ap.parse_args(argv)
 
-    df = load_results(args.results)
-    with args.results.open() as f:
-        model = json.loads(f.readline()).get("meta", {}).get("model", args.results.stem)
+    df, model = load_many(args.results)
     dec = table_decisions(df)
     rate_df = rates(dec)
     cells = phase_cells(dec)
-    stem = args.results.stem
+    stem = args.name or args.results[0].stem
+    out_dir = args.results[0].parent
 
-    cells.to_csv(args.results.with_name(f"{stem}_cells.csv"), index=False)
+    cells.to_csv(out_dir / f"{stem}_cells.csv", index=False)
     plot_phase(cells, args.figures_dir / f"{stem}_phase.png",
                f"When does {model} side with the data over the textbook law?")
     plot_levels(rate_df, args.figures_dir / f"{stem}_levels.png", f"{model}: effect of naming the law")
     report = summarize(df, dec, rate_df, model)
-    args.results.with_name(f"{stem}_summary.md").write_text(report + "\n")
+    (out_dir / f"{stem}_summary.md").write_text(report + "\n")
     print(report)
     print(f"\nFigures: {args.figures_dir}/{stem}_phase.png, {args.figures_dir}/{stem}_levels.png")
 

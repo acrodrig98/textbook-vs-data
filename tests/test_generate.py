@@ -104,3 +104,38 @@ def test_no_repeated_tables_and_laws_balanced(items):
     per_law = Counter(it["law"] for it in tables.values())
     # Laws with small x-grids can run out of distinct subsets at large row counts, so allow some slack
     assert max(per_law.values()) / min(per_law.values()) < 1.5, per_law
+
+
+def test_fake_named_differs_from_named_only_by_the_name():
+    items = make_items(list(LAWS), [2], ["mc", "numeric"], 1, 0, seed=0,
+                       levels=("named_law", "fake_named"))
+    by_key = {(it["base_id"], it["format"], it["order"], it["prior_level"]): it for it in items}
+    pairs = 0
+    for (base, fmt, order, level), it in by_key.items():
+        if level != "named_law":
+            continue
+        fake = by_key[(base, fmt, order, "fake_named")]
+        law = LAWS[it["law"]]
+        assert law.real_name in it["prompt"] and law.real_name not in fake["prompt"]
+        assert fake["prompt"] == it["prompt"].replace(law.real_name, law.fake_name)
+        assert fake["target_data"] == it["target_data"] and fake["rows"] == it["rows"]
+        pairs += 1
+    assert pairs > 0
+
+
+def test_adding_a_level_leaves_the_data_tables_unchanged():
+    """New-level prompts must line up with earlier results by base_id."""
+    base = make_items(list(LAWS), [1, 2, 3, 4], ["mc", "numeric"], 3, 0, seed=0)
+    extra = make_items(list(LAWS), [1, 2, 3, 4], ["mc", "numeric"], 3, 0, seed=0, levels=("fake_named",))
+    key = lambda it: (it["base_id"], it["format"], it["order"])
+    base_tables = {key(it): (it["rows"], it["target_data"], it["target_alt"], it.get("query_x"))
+                   for it in base if it["prior_level"] == "named_law"}
+    extra_tables = {key(it): (it["rows"], it["target_data"], it["target_alt"], it.get("query_x")) for it in extra}
+    assert base_tables == extra_tables
+
+
+def test_fake_names_are_not_real_law_names():
+    real_surnames = {"Ohm", "Hooke", "Galileo", "Coulomb", "Kepler", "Newton"}
+    for law in LAWS.values():
+        assert law.fake_name != law.real_name
+        assert not any(name in law.fake_name for name in real_surnames), law.fake_name

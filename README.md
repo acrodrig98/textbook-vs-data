@@ -23,6 +23,14 @@ python -m eval.analyze results/week1_gemma-2-2b.jsonl
 ```
 `eval.behavior` uses the plain Hugging Face model, because transcoders aren't needed yet. For each prompt it records the logits of the token for the answer the data supports and the token for the alternative. `eval.analyze` averages multiple-choice items over both letter orders, which cancels letter bias. It then writes `figures/*_phase.png` (heatmaps: rows of data x exponent shift, one per prior level and format), `figures/*_levels.png`, `results/*_cells.csv` and `results/*_summary.md`, and prints the go/no-go numbers.
 
+**Made-up-law control.** `--levels fake_named` renders the law-named prompts with only the law's name swapped for an invented one (e.g. "A Varnek's law experiment"). Data tables depend only on the seed, never on the levels, so these prompts line up with earlier results, and `eval.analyze` can merge files from the same model:
+```
+python -m prompts.generate --out data/week1_fakelaw.jsonl --levels fake_named --formats mc
+python -m eval.behavior --model Qwen/Qwen3-4B --prompts data/week1_fakelaw.jsonl
+python -m eval.analyze results/week1_Qwen3-4B.jsonl results/week1_fakelaw_Qwen3-4B.jsonl --name week1_control_Qwen3-4B
+```
+The summary then splits the textbook pull into three steps: real name to made-up name (recall of the specific law), made-up name to variable names only (any named law plus the experimental setting), and variable names to anonymous.
+
 ## Layout
 ```
 prompts/     prompt generator: laws, exponent shifts, prior-strength levels, A/B order swaps
